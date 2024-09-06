@@ -18,7 +18,7 @@ import flow_pb2
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 scaler = StandardScaler()
 
-app = faust.App('malfix', broker='kafka://localhost:19092', value_serializer='raw', producer_compression_type='lz4')
+app = faust.App('malfix', broker='kafka://kafka:9092', value_serializer='raw', producer_compression_type='lz4')
 malfix_kafka_topic = app.topic('malfix')
 
 json_flows: list = []
