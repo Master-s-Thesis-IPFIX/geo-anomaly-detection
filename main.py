@@ -18,8 +18,8 @@ import flow_pb2
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 scaler = StandardScaler()
 
-app = faust.App('malfix', broker='kafka://kafka:9092', value_serializer='raw', producer_compression_type='lz4')
-malfix_kafka_topic = app.topic('malfix')
+app = faust.App('geo-anomaly-detection', broker='kafka://kafka:9092', value_serializer='raw', producer_compression_type='lz4')
+malfix_topic = app.topic('malfix')
 
 json_flows: list = []
 
@@ -53,7 +53,7 @@ def bytes_to_ip(base_str):
         raise ValueError("Invalid byte length for IP address")
 
 
-@app.agent(malfix_kafka_topic)
+@app.agent(malfix_topic)
 async def process(flows: faust.Stream) -> None:
     async for flow in flows:
         index = 0
@@ -62,6 +62,7 @@ async def process(flows: faust.Stream) -> None:
         flow_message_bytes = flow[index:index + msg_len]
         flow_pb = flow_pb2.FlowMessage()
         flow_pb.ParseFromString(flow_message_bytes)
+        print(MessageToJson(flow_pb))
         json_flows.append(MessageToJson(flow_pb))
 
 
@@ -79,6 +80,7 @@ def ips_to_lat_lon(ips):
 
 @app.timer(interval=1.0)
 async def every_1_seconds():
+    return
     parsed_data = [json.loads(record) for record in json_flows]
     ip_geo_list = []
 
