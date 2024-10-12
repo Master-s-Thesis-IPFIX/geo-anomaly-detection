@@ -1,7 +1,5 @@
 faust-streaming
 aiokafka[lz4]
 protobuf
-darts
-gensim
 matplotlib
 basemap
