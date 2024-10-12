@@ -1,60 +1,32 @@
-import base64
 import json
-import socket
-
 import faust
-import pandas as pd
-import requests
-import torch
-from deepod.models.tabular import DeepSVDD
 from google.protobuf.internal.decoder import _DecodeVarint32
 from google.protobuf.json_format import MessageToJson
-from matplotlib import pyplot as plt
-from mpl_toolkits.basemap import Basemap
+from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 import flow_pb2
+from IP2Geo import IP2Geo
+from helper import bytes_to_ip, draw_map, geo_to_lat_long
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-scaler = StandardScaler()
-
-app = faust.App('geo-anomaly-detection', broker='kafka://kafka:9092', value_serializer='raw', producer_compression_type='lz4')
-malfix_topic = app.topic('malfix')
+app = faust.App('geo-anomaly-detection', broker='kafka://kafka:9092', producer_compression_type='lz4')
+malfix_topic = app.topic('malfix', value_serializer='raw')
+geo_anomaly_topic = app.topic('ipfix_geo_data_anomaly', value_serializer='json')
+geo_topic = app.topic('ipfix_geo_data', value_serializer='json')
 
 json_flows: list = []
 
+geo_ip = IP2Geo()
+geo_ip.load_geoip_db()
 
-def draw_map(lats_lons):
-    plt.figure(figsize=(10, 7))
+scaler = StandardScaler()
 
-    m = Basemap(projection='merc', llcrnrlat=-60, urcrnrlat=85,
-                llcrnrlon=-180, urcrnrlon=180, resolution='c')
-
-    m.drawcoastlines()
-    m.drawcountries()
-    m.drawmapboundary(fill_color='aqua')
-    m.fillcontinents(color='lightgray', lake_color='aqua')
-
-    x, y = zip(*[m(entry['lon'], entry['lat']) for entry in lats_lons])
-
-    m.scatter(x, y, marker='o', color='red', zorder=5)
-
-    plt.title('World Map with Latitude and Longitude Points')
-    plt.show()
-
-
-def bytes_to_ip(base_str):
-    byte_str = base64.b64decode(base_str)
-    if len(byte_str) == 4:
-        return socket.inet_ntoa(bytes(byte_str))
-    elif len(byte_str) == 16:
-        return socket.inet_ntop(socket.AF_INET6, bytes(byte_str))
-    else:
-        raise ValueError("Invalid byte length for IP address")
-
-
+iforest = IsolationForest(n_estimators=200,contamination=0.1, random_state=42, max_features=2)
+enable_map=False
+initial_training_finished = False
 @app.agent(malfix_topic)
 async def process(flows: faust.Stream) -> None:
+    global initial_training_finished
     async for flow in flows:
         index = 0
         msg_len, new_pos = _DecodeVarint32(flow, index)
@@ -62,48 +34,52 @@ async def process(flows: faust.Stream) -> None:
         flow_message_bytes = flow[index:index + msg_len]
         flow_pb = flow_pb2.FlowMessage()
         flow_pb.ParseFromString(flow_message_bytes)
-        print(MessageToJson(flow_pb))
-        json_flows.append(MessageToJson(flow_pb))
 
-
-def ips_to_lat_lon(ips):
-    lat_lon = []
-    try:
-        response = requests.post(f"http://ip-api.com/batch?fields=status,lat,lon,as", json=ips)
-        lat_lon = response.json()
-    except Exception as e:
-        print(e)
-    return [{"lat": geo["lat"], "lon": geo["lon"]} if geo['status'] != 'fail' else {"lat": 48.525243146351485,
-                                                                                    "lon": 9.060386676924153} for
-            geo in lat_lon]
-
-
-@app.timer(interval=1.0)
-async def every_1_seconds():
-    return
-    parsed_data = [json.loads(record) for record in json_flows]
-    ip_geo_list = []
-
-    for record in parsed_data:
+        record = json.loads(MessageToJson(flow_pb))
         record['srcAddr'] = bytes_to_ip(record['srcAddr'])
         record['dstAddr'] = bytes_to_ip(record['dstAddr'])
         record['samplerAddress'] = bytes_to_ip(record['samplerAddress'])
 
-    for i in range(0, len(parsed_data), 100):
-        ip_geo_list.extend(ips_to_lat_lon([record['dstAddr'] for record in parsed_data[i:i + 100]]))
+        src_geo = geo_ip.find_ip_entry(record['srcAddr'])
+        dst_geo = geo_ip.find_ip_entry(record['dstAddr'])
 
-    draw_map(ip_geo_list)
-    df_lat_long = pd.DataFrame(ip_geo_list).values
+        record['src_geo'] = src_geo
+        record['dst_geo'] = dst_geo
 
-    clf = DeepSVDD(device=device)
+        await geo_topic.send(value=record)
+        if initial_training_finished:
+            geos = [geo_to_lat_long(geo) for geo in [src_geo, dst_geo] if geo is not None]
 
-    clf.fit(df_lat_long, y=None)
+            if len(geos) > 0:
+                predictions = iforest.predict(scaler.fit_transform(geos))
+                if -1 in predictions:
+                    await geo_anomaly_topic.send(value=record)
 
-    test = clf.decision_function(
-        pd.DataFrame(ips_to_lat_lon(
-            ["172.221.121.1", "101.96.128.0", "116.172.130.191", "207.148.5.58", "106.52.103.154"])).values)
-    draw_map(ips_to_lat_lon(["172.221.121.1", "101.96.128.0", "116.172.130.191", "207.148.5.58", "106.52.103.154"]))
-    print(test)
+        json_flows.append(record)
 
+@app.timer(interval=60*60*24)
+async def clear():
+    json_flows.clear()
+
+@app.timer(interval=30)
+async def train():
+    global initial_training_finished, iforest
+    if len(json_flows) < 1:
+        return
+    remote_flows = []
+    for flow in json_flows:
+        if flow['dst_geo'] is not None:
+            flow['geo'] = flow['dst_geo']
+            remote_flows.append(flow)
+        if flow['src_geo'] is not None:
+            flow['geo'] = flow['src_geo']
+            remote_flows.append(flow)
+    print(len(remote_flows))
+    if len(remote_flows) > 1000:
+        geo_data = [geo_to_lat_long(flow['geo']) for flow in remote_flows]
+        iforest.fit(scaler.fit_transform(geo_data))
+        initial_training_finished=True
+        if enable_map:
+            draw_map(remote_flows, iforest.predict(scaler.fit_transform(geo_data)))
 
 app.main()
