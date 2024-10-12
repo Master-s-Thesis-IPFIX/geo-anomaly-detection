@@ -3,3 +3,4 @@ aiokafka[lz4]
 protobuf
 matplotlib
 basemap
+scikit-learn
